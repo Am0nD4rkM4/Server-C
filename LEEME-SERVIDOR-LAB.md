@@ -39,11 +39,13 @@ sudo apt install gcc netcat-openbsd nmap
 ## Compilar y correr
 
 ```bash
-gcc -Wall -o servidor servidor.c
+gcc -Wall -Wextra -pthread -o servidor servidor.c
 ./servidor
 ```
 
-Debe salir: `Servidor de laboratorio escuchando en 127.0.0.1:4444`.
+El `-pthread` es obligatorio en la v2: es el que le dice al compilador que
+el programa usa hilos (sin él, `pthread_create` no se enlaza y no compila).
+Debe salir: `Servidor de laboratorio v2 (hilos) escuchando en 127.0.0.1:4444`.
 Déjalo corriendo y abre **otra terminal** para probarlo. Se apaga con Ctrl+C.
 
 ## Probarlo con nc (el cliente de juguete)
@@ -81,7 +83,52 @@ ahora tú eres el servicio.
 
 También puedes ampliar tu `escaner.c` para que pruebe el 4444, o usar el
 módulo `recon/banner` de D4rkSploit contra `127.0.0.1:4444` y ver el banner
-`D4rkLab v1`.
+`D4rkLab v2`.
+
+## Qué cambió en la v2 (hilos)
+
+En la v1 el `main` atendía a un cliente hasta que se iba: si conectabas con
+`nc` y no escribías nada, nadie más podía entrar. Ahora por cada `accept()`
+el `main` crea un hilo (`pthread_create`) que atiende a ese cliente y sigue
+esperando al siguiente. Cada hilo tiene sus propias variables locales, así
+que cada cliente tiene su propio LOGIN.
+
+Dos detalles que valen oro y que se ven en el código:
+
+- **La copia con `malloc`:** el socket se pasa al hilo en un `int` creado
+  con `malloc`, no con la dirección de una variable del bucle. Si no, el
+  siguiente `accept()` la sobrescribiría antes de que el hilo la leyera.
+- **El candado (mutex):** el contador de clientes activos lo tocan varios
+  hilos a la vez, así que va entre `pthread_mutex_lock` y
+  `pthread_mutex_unlock`. Sin candado, dos hilos podrían leer el mismo
+  número y el conteo saldría mal: eso es una "condición de carrera".
+- **`pthread_detach`:** el hilo se limpia solo al terminar. Sin esto el
+  `main` tendría que esperar a cada hilo con `pthread_join`, y volveríamos
+  a bloquearnos.
+
+## Probar los hilos: dos clientes a la vez
+
+La prueba que demuestra que funciona: conecta un cliente y **déjalo callado**,
+luego conecta otro y úsalo. En la v1 el segundo no respondía.
+
+Terminal 1 (se queda callada, solo conectada):
+
+```bash
+nc 127.0.0.1 4444
+```
+
+Terminal 2 (esta sí trabaja, con la 1 todavía conectada):
+
+```bash
+nc 127.0.0.1 4444
+LOGIN lab lab123
+ECO hola desde el cliente 2
+```
+
+Si el cliente 2 responde, los hilos funcionan. En la terminal del servidor
+debe salir algo como `Cliente 1 conectado (activos: 1)` y
+`Cliente 2 conectado (activos: 2)`. Luego vuelve a la terminal 1, haz LOGIN
+y ECO: también responde, cada uno con su propia sesión.
 
 ## Prácticas de laboratorio (solo en 127.0.0.1)
 
@@ -104,7 +151,6 @@ cambiarlas, están en el `strcmp` del `LOGIN` en `servidor.c`.
 
 ## Qué sigue
 
-Cuando este te quede claro, el siguiente paso es que el servidor atienda a
-varios clientes a la vez con hilos (como el `ThreadPoolExecutor` de tu Mini
-InfoForge v2), o que guarde un registro de quién se conectó. Dime cuál
-quieres y lo hacemos paso a paso, como en Python.
+Los hilos ya quedaron (v2). El siguiente paso es que el servidor guarde un
+registro de quién se conectó, a qué hora y qué hizo. Dime cuando quieras y
+lo hacemos paso a paso, como en Python.
