@@ -1,4 +1,4 @@
-// servidor.c — Servidor de laboratorio en C, v2 con hilos, solo para TU propia máquina.
+// servidor.c — Servidor de laboratorio en C, v3 con hilos y registro, solo para TU propia máquina.
 // Escucha solo en 127.0.0.1 (localhost), puerto 4444. Nadie de fuera puede entrar.
 // Es tu objetivo de práctica: lo corres en Arch o en Kali y lo pruebas con
 // nmap, nc y tu escáner, para ver cómo se ve un servicio real por dentro.
@@ -15,17 +15,41 @@
 // nadie más podía entrar: si un cliente conectaba y no hacía nada, el
 // servidor quedaba bloqueado para todos. Ahora, por cada cliente que llama,
 // el main crea un hilo que lo atiende y sigue esperando al siguiente.
-#include <stdio.h>          // para printf (imprimir en pantalla)
+//
+// v3 — REGISTRO: ahora guarda en el archivo conexiones.log quién se conectó,
+// desde qué IP y puerto, si entró con LOGIN o falló, y cuándo se fue.
+// ¿Para qué sirve? En un servicio real, el registro es lo primero que se
+// mira cuando algo raro pasa: quién entró, a qué hora, y si alguien intentó
+// claves a lo loco. Aquí el registro es solo texto en un archivo, y se ve
+// con: cat conexiones.log
+// Dos ideas nuevas en esta versión:
+//   1. fopen/fprintf/fclose: abrir el archivo en modo "a" (append, añadir
+//      al final sin borrar lo que ya hay), escribir una línea y cerrarlo.
+//      Se abre y se cierra en cada evento: así, si el servidor se apaga
+//      de golpe (Ctrl+C), lo ya escrito no se pierde.
+//   2. Un struct Cliente para pasarle al hilo el socket Y la IP del que
+//      llama, juntos. En la v2 solo se pasaba el socket (un int); ahora
+//      hacen falta dos datos más, así que van en una cajita con nombre.
+//      La cajita se crea con malloc en el main y el hilo la libera con
+//      free cuando ya copió los datos, igual que se hacía con el int.
+//   3. Un segundo candado (mutex) solo para el archivo: si dos hilos
+//      escribieran a la vez, sus líneas se mezclarían a la mitad. El
+//      candado hace que escriban por turnos, una línea completa cada uno.
+#include <stdio.h>          // para printf, fopen, fprintf, fclose
 #include <stdlib.h>         // para malloc y free
-#include <string.h>         // para strcmp, strlen, strncmp (comparar texto)
-#include <time.h>           // para la hora del comando HORA
+#include <string.h>         // para strcmp, strlen, strncmp, strncpy
+#include <time.h>           // para time, localtime, strftime (la hora del registro)
 #include <pthread.h>        // para los hilos: pthread_create, pthread_detach, pthread_mutex_t
 #include <sys/socket.h>     // para socket(), bind(), listen(), accept()
-#include <arpa/inet.h>      // para la dirección 127.0.0.1
+#include <arpa/inet.h>      // para la dirección 127.0.0.1 e inet_ntoa
 #include <unistd.h>         // para close() (colgar el "teléfono")
 
 // Puerto donde escucha el servidor. 4444 es un puerto típico de laboratorio.
 #define PUERTO 4444
+
+// Nombre del archivo donde se guarda el registro. Se crea en la misma
+// carpeta desde donde corres ./servidor.
+#define ARCHIVO_REGISTRO "conexiones.log"
 
 // Contador de clientes conectados ahora mismo y número del próximo cliente.
 // Los tocan varios hilos a la vez, así que van protegidos con un candado
@@ -37,13 +61,54 @@ static int clientes_activos = 0;
 static int proximo_numero = 0;
 static pthread_mutex_t candado = PTHREAD_MUTEX_INITIALIZER;
 
+// Segundo candado, solo para escribir en el archivo de registro.
+static pthread_mutex_t candado_registro = PTHREAD_MUTEX_INITIALIZER;
+
+// Esta cajita (struct) junta los datos de un cliente que llama: su socket,
+// su IP y su puerto. El main la llena con accept() y se la pasa al hilo.
+// struct es como una ficha con varios campos: cada campo tiene su nombre
+// y su tipo, y se lee con punto, por ejemplo datos->socket.
+struct Cliente {
+    int socket;       // el "teléfono" solo para hablar con este cliente
+    char ip[64];      // la IP desde donde llamó, por ejemplo "127.0.0.1"
+    int puerto;       // el puerto desde donde llamó (lo elige su sistema)
+};
+
+// registrar() escribe UNA línea en conexiones.log, con la fecha y la hora.
+// Ejemplo de línea: [2026-11-20 07:05:00] Cliente 1 conectado desde 127.0.0.1:54321 (activos: 1)
+// strftime() convierte la hora a texto con el formato que le pidas:
+// %Y año, %m mes, %d día, %H hora, %M minuto, %S segundo.
+// El candado hace que solo un hilo escriba a la vez: sin él, dos hilos
+// podrían escribir a la vez y sus líneas saldrían mezcladas.
+void registrar(const char *evento) {
+    pthread_mutex_lock(&candado_registro);
+
+    // "a" = append: añadir al final del archivo, sin borrar lo anterior.
+    // Si el archivo no existe, fopen lo crea vacío.
+    FILE *f = fopen(ARCHIVO_REGISTRO, "a");
+    if (f != NULL) {
+        time_t ahora = time(NULL);
+        struct tm *t = localtime(&ahora);  // localtime: la hora en tu zona horaria
+        char fecha[32];
+        strftime(fecha, sizeof(fecha), "%Y-%m-%d %H:%M:%S", t);
+        fprintf(f, "[%s] %s\n", fecha, evento);
+        fclose(f);  // cerrar es lo que de verdad deja la línea guardada en el disco
+    }
+    // Si fopen falla (por ejemplo, sin permiso en la carpeta), no se rompe
+    // nada: el servidor sigue atendiendo, solo no queda registro.
+
+    pthread_mutex_unlock(&candado_registro);
+}
+
 // Esta función atiende UNA línea (un comando) y responde al cliente.
 // Devuelve 1 si el cliente pidió SALIR, 0 si hay que seguir.
 // Se separó en su propia función porque un solo recv() puede traer varias
 // líneas juntas (por ejemplo, si se mandan por tubería o con un script),
 // y cada línea es un comando distinto.
-int atender_linea(int cliente, char *mensaje, int *dentro) {
+// mi_numero e ip son solo para el registro: para saber QUIÉN hizo el LOGIN.
+int atender_linea(int cliente, char *mensaje, int *dentro, int mi_numero, const char *ip) {
     char respuesta[512];
+    char evento[256];
 
     if (strcmp(mensaje, "AYUDA") == 0) {
         // strcmp compara dos textos: devuelve 0 cuando son iguales.
@@ -61,8 +126,20 @@ int atender_linea(int cliente, char *mensaje, int *dentro) {
             strcmp(usuario, "lab") == 0 && strcmp(clave, "lab123") == 0) {
             *dentro = 1;
             snprintf(respuesta, sizeof(respuesta), "OK: dentro. Prueba ECO, HORA y QUIEN.\n");
+            // Registrar el LOGIN bueno: en un servicio real, esto es lo que
+            // te dice quién entró de verdad y quién solo lo intentó.
+            snprintf(evento, sizeof(evento),
+                "Cliente %d (%s): LOGIN correcto (usuario %s)", mi_numero, ip, usuario);
+            registrar(evento);
         } else {
             snprintf(respuesta, sizeof(respuesta), "MAL: usuario o clave incorrectos.\n");
+            // Registrar también el LOGIN fallido: si alguien prueba claves
+            // una y otra vez, aquí es donde se ve. %s con usuario puede
+            // quedar vacío si solo escribió "LOGIN" sin nada más.
+            snprintf(evento, sizeof(evento),
+                "Cliente %d (%s): LOGIN fallido (usuario %s)", mi_numero, ip,
+                (sscanf(mensaje + 6, "%63s", usuario) == 1) ? usuario : "?");
+            registrar(evento);
         }
     } else if (strcmp(mensaje, "SALIR") == 0) {
         snprintf(respuesta, sizeof(respuesta), "Adios.\n");
@@ -89,14 +166,19 @@ int atender_linea(int cliente, char *mensaje, int *dentro) {
 
 // Esta función es el trabajo de UN hilo: atiende a un solo cliente desde
 // que se conecta hasta que se va (SALIR o colgar).
-// Recibe un puntero a un int que guarda el socket del cliente. El int se
-// creó con malloc() en el main: si pasáramos la dirección de una variable
-// local del bucle, el siguiente accept() la sobrescribiría antes de que
-// este hilo la leyera (una "carrera" entre hilos). Con malloc cada hilo
-// tiene su propia copia, y él mismo la libera con free() al terminar.
+// Recibe un puntero al struct Cliente que creó el main. El hilo copia sus
+// datos a variables locales y libera la cajita con free(): si pasáramos la
+// dirección de una variable local del bucle, el siguiente accept() la
+// sobrescribiría antes de que este hilo la leyera (una "carrera" entre
+// hilos). Con malloc cada hilo tiene su propia copia.
 void *atender_cliente(void *arg) {
-    int cliente = *(int *)arg;  // sacar el socket del puntero
-    free(arg);                  // ya no hace falta la copia
+    struct Cliente *datos = (struct Cliente *)arg;
+    int cliente = datos->socket;
+    char ip[64];
+    strncpy(ip, datos->ip, sizeof(ip) - 1);  // copiar la IP a una variable local
+    ip[sizeof(ip) - 1] = '\0';
+    int puerto_cliente = datos->puerto;
+    free(datos);  // ya no hace falta la cajita
 
     // Contar este cliente: el candado hace que solo un hilo a la vez
     // toque los contadores. Sin candado, dos hilos podrían leer "2" a la
@@ -109,11 +191,17 @@ void *atender_cliente(void *arg) {
     int activos = clientes_activos;
     pthread_mutex_unlock(&candado);  // soltar el candado cuanto antes
 
-    printf("Cliente %d conectado (activos: %d).\n", mi_numero, activos);
+    printf("Cliente %d conectado desde %s:%d (activos: %d).\n", mi_numero, ip, puerto_cliente, activos);
     fflush(stdout);
 
+    // Registrar la conexión: la primera línea que deja cada cliente.
+    char evento[256];
+    snprintf(evento, sizeof(evento),
+        "Cliente %d conectado desde %s:%d (activos: %d)", mi_numero, ip, puerto_cliente, activos);
+    registrar(evento);
+
     // El banner es lo primero que ve quien se conecta, como en un servicio real.
-    char *banner = "D4rkLab v2 — servidor de practica con hilos (solo 127.0.0.1)\nEscribe AYUDA para ver los comandos.\n";
+    char *banner = "D4rkLab v3 — servidor de practica con hilos y registro (solo 127.0.0.1)\nEscribe AYUDA para ver los comandos.\n";
     send(cliente, banner, strlen(banner), 0);
 
     int dentro = 0;  // 0 = aún no entró, 1 = ya pasó el LOGIN (propio de este hilo)
@@ -138,7 +226,7 @@ void *atender_cliente(void *arg) {
                 }
                 linea[en_linea] = '\0';  // '\0' marca el final del texto en C
                 en_linea = 0;
-                salir = atender_linea(cliente, linea, &dentro);
+                salir = atender_linea(cliente, linea, &dentro, mi_numero, ip);
             } else if (en_linea < (int)sizeof(linea) - 1) {
                 linea[en_linea++] = trozo[i];
             }
@@ -152,6 +240,11 @@ void *atender_cliente(void *arg) {
     pthread_mutex_unlock(&candado);
     printf("Cliente %d desconectado (activos: %d).\n", mi_numero, activos);
     fflush(stdout);
+    // Registrar la desconexión, anotando si llegó a entrar o se fue sin LOGIN.
+    snprintf(evento, sizeof(evento),
+        "Cliente %d (%s:%d) desconectado (activos: %d, dentro: %s)",
+        mi_numero, ip, puerto_cliente, activos, dentro ? "si" : "no");
+    registrar(evento);
     return NULL;  // al volver, el hilo termina y, como es detached, se limpia solo
 }
 
@@ -179,10 +272,12 @@ int main() {
 
     // 4. listen() lo pone "a la escucha": ya puede recibir llamadas, 5 en espera.
     listen(servidor, 5);
-    printf("Servidor de laboratorio v2 (hilos) escuchando en 127.0.0.1:%d\n", PUERTO);
+    printf("Servidor de laboratorio v3 (hilos + registro) escuchando en 127.0.0.1:%d\n", PUERTO);
     printf("Atiende a varios clientes a la vez. Pruébalo con: nc 127.0.0.1 %d\n", PUERTO);
+    printf("El registro se guarda en: %s\n", ARCHIVO_REGISTRO);
     printf("Pulsa Ctrl+C para apagarlo.\n");
     fflush(stdout);  // que se vea enseguida aunque la salida vaya a un archivo
+    registrar("Servidor v3 arrancado en 127.0.0.1:4444");
 
     // Bucle sin fin: por cada cliente que llama, se crea un hilo que lo
     // atiende y el main sigue esperando al siguiente. Antes (v1) el main
@@ -191,24 +286,36 @@ int main() {
     // servidor quedaba bloqueado para todos.
     while (1) {
         // 5. accept() espera a que alguien "llame" y contesta: devuelve un
-        //    socket nuevo, solo para hablar con ese cliente.
-        int cliente = accept(servidor, NULL, NULL);
+        //    socket nuevo, solo para hablar con este cliente.
+        //    Ahora accept() también llena cliente_addr con la IP y el puerto
+        //    de quien llamó: por eso se le pasan la dirección y su tamaño.
+        struct sockaddr_in cliente_addr;
+        socklen_t largo_addr = sizeof(cliente_addr);
+        int cliente = accept(servidor, (struct sockaddr *)&cliente_addr, &largo_addr);
 
-        // Cada hilo necesita su propia copia del socket (ver atender_cliente).
-        int *copia = malloc(sizeof(int));
-        if (copia == NULL) {
+        // La cajita con los datos del cliente, creada con malloc para que
+        // cada hilo tenga su propia copia (ver atender_cliente).
+        struct Cliente *datos = malloc(sizeof(struct Cliente));
+        if (datos == NULL) {
             close(cliente);
             continue;
         }
-        *copia = cliente;
+        datos->socket = cliente;
+        // inet_ntoa() convierte la IP a texto, pero devuelve un puntero a
+        // un buffer compartido que la siguiente llamada sobrescribe: por
+        // eso se copia enseguida con strncpy, antes de que otro hilo lo pise.
+        // ntohs() convierte el puerto del orden de la red al de la máquina.
+        strncpy(datos->ip, inet_ntoa(cliente_addr.sin_addr), sizeof(datos->ip) - 1);
+        datos->ip[sizeof(datos->ip) - 1] = '\0';
+        datos->puerto = ntohs(cliente_addr.sin_port);
 
         // pthread_create() arranca el hilo: le dice qué función corre
-        // (atender_cliente) y con qué dato (copia). pthread_t es el
+        // (atender_cliente) y con qué dato (datos). pthread_t es el
         // "nombre" del hilo, como un PID.
         pthread_t hilo;
-        if (pthread_create(&hilo, NULL, atender_cliente, copia) != 0) {
+        if (pthread_create(&hilo, NULL, atender_cliente, datos) != 0) {
             printf("No pude crear el hilo para el cliente.\n");
-            free(copia);
+            free(datos);
             close(cliente);
             continue;
         }
