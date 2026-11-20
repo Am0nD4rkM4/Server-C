@@ -1,9 +1,23 @@
-// servidor.c — Servidor de laboratorio en C, v3 con hilos y registro, solo para TU propia máquina.
-// Escucha solo en 127.0.0.1 (localhost), puerto 4444. Nadie de fuera puede entrar.
+// servidor.c — Servidor de laboratorio en C, v4 con IP virtual, solo para TU propia máquina.
+// Escucha en 10.10.10.10, puerto 4444. Esa IP es virtual: vive solo en tu
+// máquina, no es otra computadora ni sale a internet. Nadie de fuera puede entrar.
 // Es tu objetivo de práctica: lo corres en Arch o en Kali y lo pruebas con
 // nmap, nc y tu escáner, para ver cómo se ve un servicio real por dentro.
 // No ejecuta comandos del sistema ni abre archivos: solo responde texto.
 // Usuario y clave de práctica: lab / lab123 (no son reales, solo para el lab).
+//
+// v4 — IP VIRTUAL: antes escuchaba en 127.0.0.1 (localhost), que es la
+// máquina hablando consigo misma, y eso se siente falso al atacar. Ahora
+// escucha en 10.10.10.10, una IP que tú le inventas a tu propia máquina
+// con un comando (ver LEEME-IP-VIRTUAL.md). Es como ponerle un segundo
+// nombre a tu laptop: nmap y nc la ven como si fuera otro equipo, pero
+// el tráfico nunca sale de tu máquina. Si no creas la IP, el servidor no
+// arranca y te dice cómo crearla.
+// ¿Qué es una IP virtual? Tu tarjeta de red puede tener varias IPs a la
+// vez. 127.0.0.1 es la de siempre (loopback, "esta máquina"). Con
+// `ip addr add 10.10.10.10/32 dev lo` le añades otra a esa misma interfaz.
+// 10.10.10.10 es del rango privado 10.x.x.x, que no existe en internet:
+// por eso es seguro para el laboratorio, nadie de fuera puede llegar ahí.
 //
 // v2 — HILOS: ahora atiende a varios clientes A LA VEZ.
 // ¿Qué es un hilo? Un hilo es como un trabajador más dentro del mismo
@@ -41,11 +55,26 @@
 #include <time.h>           // para time, localtime, strftime (la hora del registro)
 #include <pthread.h>        // para los hilos: pthread_create, pthread_detach, pthread_mutex_t
 #include <sys/socket.h>     // para socket(), bind(), listen(), accept()
-#include <arpa/inet.h>      // para la dirección 127.0.0.1 e inet_ntoa
+#include <arpa/inet.h>      // para inet_pton (texto a IP) e inet_ntoa (IP a texto)
 #include <unistd.h>         // para close() (colgar el "teléfono")
 
 // Puerto donde escucha el servidor. 4444 es un puerto típico de laboratorio.
 #define PUERTO 4444
+
+// La IP donde escucha el servidor. 10.10.10.10 es una IP virtual que tú
+// creas en tu máquina con: sudo ip addr add 10.10.10.10/32 dev lo
+// (ver LEEME-IP-VIRTUAL.md). Si la cambias aquí, cambia también ese comando.
+// #ifndef significa "si nadie la definió antes": así puedes probar otra IP
+// sin tocar el archivo, compilando con -DIP_SERVIDOR='"127.0.0.2"'.
+// Otras opciones, solo para tu laboratorio:
+//   "127.0.0.1"  = como antes, solo esta máquina (se siente menos real).
+//   "192.168.0.108" = tu IP del Wi-Fi: ahí sí llega cualquiera de tu casa
+//     que esté en el mismo Wi-Fi, y lo puedes atacar hasta desde el celular.
+//   "0.0.0.0"    = todas las interfaces a la vez: cualquiera de tu red lo ve.
+//     Solo en tu casa y solo para el lab, nunca con el router abierto a internet.
+#ifndef IP_SERVIDOR
+#define IP_SERVIDOR "10.10.10.10"
+#endif
 
 // Nombre del archivo donde se guarda el registro. Se crea en la misma
 // carpeta desde donde corres ./servidor.
@@ -201,7 +230,11 @@ void *atender_cliente(void *arg) {
     registrar(evento);
 
     // El banner es lo primero que ve quien se conecta, como en un servicio real.
-    char *banner = "D4rkLab v3 — servidor de practica con hilos y registro (solo 127.0.0.1)\nEscribe AYUDA para ver los comandos.\n";
+    // Se arma con snprintf para que muestre la IP real donde escucha.
+    char banner[256];
+    snprintf(banner, sizeof(banner),
+        "D4rkLab v4 — servidor de practica con hilos y registro (IP %s)\nEscribe AYUDA para ver los comandos.\n",
+        IP_SERVIDOR);
     send(cliente, banner, strlen(banner), 0);
 
     int dentro = 0;  // 0 = aún no entró, 1 = ya pasó el LOGIN (propio de este hilo)
@@ -252,11 +285,18 @@ int main() {
     // 1. socket() crea el "teléfono": AF_INET = por internet, SOCK_STREAM = TCP.
     int servidor = socket(AF_INET, SOCK_STREAM, 0);
 
-    // 2. La dirección donde va a escuchar: solo 127.0.0.1, solo esta máquina.
+    // 2. La dirección donde va a escuchar: IP_SERVIDOR (por defecto la IP
+    //    virtual 10.10.10.10), puerto 4444.
     struct sockaddr_in direccion;
     direccion.sin_family = AF_INET;
     direccion.sin_port = htons(PUERTO);  // htons: el puerto en el orden de la red
-    direccion.sin_addr.s_addr = inet_addr("127.0.0.1");
+    // inet_pton() convierte el texto "10.10.10.10" a su forma binaria, la que
+    // entiende el socket. Devuelve 1 si el texto es una IP válida, 0 si no.
+    // Es mejor que el viejo inet_addr(): ese no avisa cuando la IP está mal.
+    if (inet_pton(AF_INET, IP_SERVIDOR, &direccion.sin_addr) != 1) {
+        printf("La IP del servidor está mal escrita: %s\n", IP_SERVIDOR);
+        return 1;
+    }
 
     // SO_REUSEADDR: permite volver a usar el puerto 4444 enseguida después
     // de apagar el servidor, sin que diga "Address already in use".
@@ -265,19 +305,24 @@ int main() {
 
     // 3. bind() "amarra" el teléfono a esa dirección y ese puerto.
     //    Si otro programa ya usa el 4444, bind falla y el servidor no arranca.
+    //    Si la IP virtual no existe en tu máquina, bind también falla: ahí
+    //    es cuando hay que crearla con el comando de la guía.
     if (bind(servidor, (struct sockaddr *)&direccion, sizeof(direccion)) != 0) {
-        printf("No pude usar el puerto %d, ¿ya hay otro servidor corriendo?\n", PUERTO);
+        printf("No pude usar %s:%d. ¿Ya hay otro servidor corriendo?\n", IP_SERVIDOR, PUERTO);
+        printf("Si es la IP virtual, créala primero: sudo ip addr add %s/32 dev lo\n", IP_SERVIDOR);
         return 1;
     }
 
     // 4. listen() lo pone "a la escucha": ya puede recibir llamadas, 5 en espera.
     listen(servidor, 5);
-    printf("Servidor de laboratorio v3 (hilos + registro) escuchando en 127.0.0.1:%d\n", PUERTO);
-    printf("Atiende a varios clientes a la vez. Pruébalo con: nc 127.0.0.1 %d\n", PUERTO);
+    printf("Servidor de laboratorio v4 (hilos + registro + IP virtual) escuchando en %s:%d\n", IP_SERVIDOR, PUERTO);
+    printf("Atiende a varios clientes a la vez. Pruébalo con: nc %s %d\n", IP_SERVIDOR, PUERTO);
     printf("El registro se guarda en: %s\n", ARCHIVO_REGISTRO);
     printf("Pulsa Ctrl+C para apagarlo.\n");
     fflush(stdout);  // que se vea enseguida aunque la salida vaya a un archivo
-    registrar("Servidor v3 arrancado en 127.0.0.1:4444");
+    char arranque[128];
+    snprintf(arranque, sizeof(arranque), "Servidor v4 arrancado en %s:%d", IP_SERVIDOR, PUERTO);
+    registrar(arranque);
 
     // Bucle sin fin: por cada cliente que llama, se crea un hilo que lo
     // atiende y el main sigue esperando al siguiente. Antes (v1) el main
