@@ -1,10 +1,36 @@
-// servidor.c — Servidor de laboratorio en C, v4 con IP virtual, solo para TU propia máquina.
-// Escucha en 10.10.10.10, puerto 4444. Esa IP es virtual: vive solo en tu
-// máquina, no es otra computadora ni sale a internet. Nadie de fuera puede entrar.
-// Es tu objetivo de práctica: lo corres en Arch o en Kali y lo pruebas con
-// nmap, nc y tu escáner, para ver cómo se ve un servicio real por dentro.
+// servidor.c — Servidor de laboratorio en C, v6 con cambio de clave, para TU propio VPS.
+// En el VPS se compila con -DIP_SERVIDOR='"0.0.0.0"' y escucha en todas
+// sus interfaces, puerto 4444. En tu casa sigue usando la v4 con la IP
+// virtual, no esta versión.
+// Es tu objetivo de práctica en internet: lo corres en un VPS gratis de
+// Oracle y lo pruebas desde tu casa con nmap, nc y tu escáner.
 // No ejecuta comandos del sistema ni abre archivos: solo responde texto.
-// Usuario y clave de práctica: lab / lab123 (no son reales, solo para el lab).
+// La clave se pone con la variable de entorno SERVER_C_CLAVE, y ahora
+// también se puede CAMBIAR desde dentro, con el comando CLAVE, sin
+// apagar el servidor. La clave nunca se escribe en el código, ni se
+// guarda en ningún archivo, ni se imprime: solo vive en la memoria del
+// servidor y se compara con strcmp().
+//
+// v6 — CAMBIO DE CLAVE: un servicio real te deja cambiar tu contraseña
+// cuando quieras, y este ya también. Dentro, con LOGIN hecho, escribes:
+//   CLAVE <nueva-clave>
+// y desde ahí la nueva es la que vale para todos. La vieja deja de
+// funcionar en ese momento. El cambio dura mientras el servidor esté
+// corriendo: si lo apagas y lo vuelves a correr, vuelve a valer la de
+// SERVER_C_CLAVE (o lab123 si no pusiste ninguna).
+// La clave es una sola para todos y la tocan varios hilos a la vez, así
+// que tiene su propio candado (candado_clave): sin él, un hilo podría
+// leerla a la mitad de cambiarla otro y comparar una clave mezclada.
+//
+// v5 — CLAVE CONFIGURABLE: en la v4 la clave estaba escrita en el código
+// (lab/lab123), y eso en internet es regalar la entrada: cualquiera la
+// adivina en el primer intento. Ahora la clave vive FUERA del código, en
+// una variable de entorno, igual que la clave de Shodan en InfoForge:
+//   SERVER_C_CLAVE="una-clave-fuerte" ./servidor
+// getenv() lee una variable de entorno: devuelve su texto, o NULL si no
+// existe. Si no existe, el servidor usa lab123 y avisa en el arranque.
+// La clave NUNCA se escribe en el código, ni se sube a GitHub, ni se
+// imprime en pantalla: solo se compara con strcmp().
 //
 // v4 — IP VIRTUAL: antes escuchaba en 127.0.0.1 (localhost), que es la
 // máquina hablando consigo misma, y eso se siente falso al atacar. Ahora
@@ -80,6 +106,15 @@
 // carpeta desde donde corres ./servidor.
 #define ARCHIVO_REGISTRO "conexiones.log"
 
+// La clave del servidor. Se llena en main() con la variable de entorno
+// SERVER_C_CLAVE (getenv): si no existe, queda "lab123", la de práctica,
+// y el arranque avisa. Nunca se imprime la clave en pantalla ni se sube
+// a GitHub: solo se compara con strcmp() en el LOGIN.
+// Tercer candado, solo para la clave: la leen y la escriben varios hilos
+// (LOGIN la lee, CLAVE la cambia), y sin candado podrían pisarse.
+static char clave_servidor[128] = "lab123";
+static pthread_mutex_t candado_clave = PTHREAD_MUTEX_INITIALIZER;
+
 // Contador de clientes conectados ahora mismo y número del próximo cliente.
 // Los tocan varios hilos a la vez, así que van protegidos con un candado
 // (mutex): ver atender_cliente().
@@ -143,7 +178,8 @@ int atender_linea(int cliente, char *mensaje, int *dentro, int mi_numero, const 
         // strcmp compara dos textos: devuelve 0 cuando son iguales.
         snprintf(respuesta, sizeof(respuesta),
             "Comandos:\n"
-            "  LOGIN <usuario> <clave> — entrar (prueba: lab lab123)\n"
+            "  LOGIN <usuario> <clave> — entrar (usuario lab, clave en SERVER_C_CLAVE)\n"
+            "  CLAVE <nueva-clave> — cambiar la clave (solo dentro, mínimo 4 caracteres)\n"
             "  ECO <texto> — repite tu texto (solo dentro)\n"
             "  HORA — la hora del servidor (solo dentro)\n"
             "  QUIEN — quien eres en este lab (solo dentro)\n"
@@ -151,8 +187,18 @@ int atender_linea(int cliente, char *mensaje, int *dentro, int mi_numero, const 
     } else if (strncmp(mensaje, "LOGIN ", 6) == 0) {
         // strncmp compara solo los primeros 6 caracteres: "LOGIN ".
         char usuario[64], clave[64];
+        // Primero se lee usuario y clave del mensaje, y que el usuario sea
+        // "lab". La clave se compara con candado: otro hilo podría estar
+        // cambiándola justo en ese momento con CLAVE, y sin candado se
+        // compararía una clave a la mitad (mezcla de la vieja y la nueva).
+        int clave_ok = 0;
         if (sscanf(mensaje + 6, "%63s %63s", usuario, clave) == 2 &&
-            strcmp(usuario, "lab") == 0 && strcmp(clave, "lab123") == 0) {
+            strcmp(usuario, "lab") == 0) {
+            pthread_mutex_lock(&candado_clave);
+            clave_ok = (strcmp(clave, clave_servidor) == 0);
+            pthread_mutex_unlock(&candado_clave);
+        }
+        if (clave_ok) {
             *dentro = 1;
             snprintf(respuesta, sizeof(respuesta), "OK: dentro. Prueba ECO, HORA y QUIEN.\n");
             // Registrar el LOGIN bueno: en un servicio real, esto es lo que
@@ -178,13 +224,44 @@ int atender_linea(int cliente, char *mensaje, int *dentro, int mi_numero, const 
         // Sin LOGIN, estos comandos no responden: así se ve un
         // servicio que pide autenticación antes de hacer nada.
         snprintf(respuesta, sizeof(respuesta), "Primero entra con LOGIN <usuario> <clave>.\n");
+    } else if (strcmp(mensaje, "CLAVE") == 0) {
+        // "CLAVE" sola, sin nada más: no entra en el strncmp de abajo
+        // porque ese busca "CLAVE " con espacio. Aquí se le dice cómo se usa.
+        snprintf(respuesta, sizeof(respuesta), "Uso: CLAVE <nueva-clave>\n");
+    } else if (strncmp(mensaje, "CLAVE ", 6) == 0) {
+        // CLAVE <nueva-clave>: cambiar la clave del servidor sin apagarlo.
+        // Solo llega aquí quien ya hizo LOGIN (el !dentro de arriba lo
+        // bloquea si no). %63s lee una sola palabra: la clave no puede
+        // tener espacios, porque el espacio separa los comandos.
+        char nueva[64];
+        if (sscanf(mensaje + 6, "%63s", nueva) != 1) {
+            snprintf(respuesta, sizeof(respuesta), "Uso: CLAVE <nueva-clave>\n");
+        } else if (strlen(nueva) < 4) {
+            snprintf(respuesta, sizeof(respuesta), "La clave debe tener al menos 4 caracteres.\n");
+        } else {
+            // Cambiarla con candado: otro hilo podría estar comparándola
+            // en su LOGIN justo ahora. La nueva vale desde este momento
+            // para todos, y la vieja deja de funcionar.
+            pthread_mutex_lock(&candado_clave);
+            strncpy(clave_servidor, nueva, sizeof(clave_servidor) - 1);
+            clave_servidor[sizeof(clave_servidor) - 1] = '\0';
+            pthread_mutex_unlock(&candado_clave);
+            snprintf(respuesta, sizeof(respuesta),
+                "OK: clave cambiada. La proxima vez entra con la nueva. Esta sesion sigue dentro.\n");
+            // Se registra EL HECHO del cambio, nunca la clave nueva: el
+            // registro lo puede leer cualquiera que entre a la máquina, y
+            // una contraseña no se escribe en ningún log.
+            snprintf(evento, sizeof(evento),
+                "Cliente %d (%s): cambio de clave", mi_numero, ip);
+            registrar(evento);
+        }
     } else if (strncmp(mensaje, "ECO ", 4) == 0) {
         snprintf(respuesta, sizeof(respuesta), "Eco: %s\n", mensaje + 4);
     } else if (strcmp(mensaje, "HORA") == 0) {
         time_t ahora = time(NULL);  // time() da la hora actual
         snprintf(respuesta, sizeof(respuesta), "Hora: %s", ctime(&ahora));
     } else if (strcmp(mensaje, "QUIEN") == 0) {
-        snprintf(respuesta, sizeof(respuesta), "Eres el usuario lab, en el laboratorio local.\n");
+        snprintf(respuesta, sizeof(respuesta), "Eres el usuario lab, en el laboratorio.\n");
     } else {
         snprintf(respuesta, sizeof(respuesta), "Comando desconocido. Escribe AYUDA.\n");
     }
@@ -233,7 +310,7 @@ void *atender_cliente(void *arg) {
     // Se arma con snprintf para que muestre la IP real donde escucha.
     char banner[256];
     snprintf(banner, sizeof(banner),
-        "D4rkLab v4 — servidor de practica con hilos y registro (IP %s)\nEscribe AYUDA para ver los comandos.\n",
+        "D4rkLab v6 — servidor de practica con hilos, registro y cambio de clave (IP %s)\nEscribe AYUDA para ver los comandos.\n",
         IP_SERVIDOR);
     send(cliente, banner, strlen(banner), 0);
 
@@ -282,6 +359,20 @@ void *atender_cliente(void *arg) {
 }
 
 int main() {
+    // 0. La clave: se lee de la variable de entorno SERVER_C_CLAVE.
+    //    getenv() devuelve el texto de la variable, o NULL si no existe.
+    //    Si no existe o está vacía, queda "lab123" y se avisa: en internet
+    //    eso es regalar la entrada, así que no se corre así en el VPS.
+    //    La clave no se imprime jamás: solo se dice si es la personalizada.
+    const char *clave_env = getenv("SERVER_C_CLAVE");
+    int clave_personalizada = 0;
+    if (clave_env != NULL && clave_env[0] != '\0') {
+        // strncpy copia con límite para no pasarse del tamaño del arreglo.
+        strncpy(clave_servidor, clave_env, sizeof(clave_servidor) - 1);
+        clave_servidor[sizeof(clave_servidor) - 1] = '\0';
+        clave_personalizada = 1;
+    }
+
     // 1. socket() crea el "teléfono": AF_INET = por internet, SOCK_STREAM = TCP.
     int servidor = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -315,13 +406,18 @@ int main() {
 
     // 4. listen() lo pone "a la escucha": ya puede recibir llamadas, 5 en espera.
     listen(servidor, 5);
-    printf("Servidor de laboratorio v4 (hilos + registro + IP virtual) escuchando en %s:%d\n", IP_SERVIDOR, PUERTO);
+    printf("Servidor de laboratorio v6 (hilos + registro + IP virtual + clave configurable y cambiable) escuchando en %s:%d\n", IP_SERVIDOR, PUERTO);
+    if (clave_personalizada) {
+        printf("Clave personalizada activada (SERVER_C_CLAVE). No la muestro por seguridad.\n");
+    } else {
+        printf("AVISO: usando la clave de practica lab123. En internet pon una fuerte: SERVER_C_CLAVE=\"tu-clave\" ./servidor\n");
+    }
     printf("Atiende a varios clientes a la vez. Pruébalo con: nc %s %d\n", IP_SERVIDOR, PUERTO);
     printf("El registro se guarda en: %s\n", ARCHIVO_REGISTRO);
     printf("Pulsa Ctrl+C para apagarlo.\n");
     fflush(stdout);  // que se vea enseguida aunque la salida vaya a un archivo
     char arranque[128];
-    snprintf(arranque, sizeof(arranque), "Servidor v4 arrancado en %s:%d", IP_SERVIDOR, PUERTO);
+    snprintf(arranque, sizeof(arranque), "Servidor v6 arrancado en %s:%d", IP_SERVIDOR, PUERTO);
     registrar(arranque);
 
     // Bucle sin fin: por cada cliente que llama, se crea un hilo que lo
